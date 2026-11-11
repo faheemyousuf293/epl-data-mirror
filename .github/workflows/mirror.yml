@@ -1,6 +1,6 @@
 name: Mirror football data
 
-# Copies EPL data from football-data.co.uk and fixturedownload.com into this repo,
+# Copies EPL and Allsvenskan data from football-data.co.uk and fixturedownload.com into this repo,
 # so Claude's scheduled updates can read it from raw.githubusercontent.com.
 
 on:
@@ -65,6 +65,25 @@ jobs:
           print(f"fixturedownload.com: {scored(new)} scored / {len(new)} fixtures")
           PY
 
+      - name: Download Allsvenskan (all seasons since 2012, one file)
+        if: ${{ always() }}   # run even if the EPL step failed
+        run: |
+          set -euo pipefail
+          mkdir -p data/football-data
+          curl -fsSL --retry 3 --retry-delay 10 -A "$UA" \
+            "https://www.football-data.co.uk/new/SWE.csv" -o /tmp/SWE.csv
+          grep -q 'Country,League,Season,Date,Time,Home,Away,HG,AG' /tmp/SWE.csv || { echo "SWE.csv header looks wrong"; exit 1; }
+          new_rows=$(( $(wc -l < /tmp/SWE.csv) - 1 ))
+          target="data/football-data/SWE.csv"
+          if [ -f "$target" ]; then
+            old_rows=$(( $(wc -l < "$target") - 1 ))
+            if [ "$new_rows" -lt "$old_rows" ]; then
+              echo "Refusing to shrink $target ($old_rows -> $new_rows rows)"; exit 1
+            fi
+          fi
+          mv /tmp/SWE.csv "$target"
+          echo "Allsvenskan: $new_rows rows"
+
       - name: Backfill past seasons (one-off)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.backfill }}
         run: |
@@ -78,6 +97,7 @@ jobs:
           done
 
       - name: Commit if anything changed
+        if: ${{ always() }}   # commit whatever downloaded fine; the run still shows as failed if a step failed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
