@@ -1,0 +1,90 @@
+name: Mirror football data
+
+# Copies EPL data from football-data.co.uk and fixturedownload.com into this repo,
+# so Claude's scheduled updates can read it from raw.githubusercontent.com.
+
+on:
+  schedule:
+    - cron: '17 4 * * *'    # every day 04:17 UTC (05:17 Stockholm in winter)
+    - cron: '47 22 * * *'   # every day 22:47 UTC, catches same-evening uploads
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: 'Also download all past seasons (2000-01 to 2025-26). Run once.'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  SEASON_CODE: '2627'          # football-data.co.uk season code (2026-27)
+  FIXTURE_FEED: 'epl-2026'     # fixturedownload.com feed name (2026-27)
+  UA: 'Mozilla/5.0 (epl-data-mirror; personal use)'
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download current season
+        run: |
+          set -euo pipefail
+          mkdir -p data/football-data data/fixturedownload
+
+          # ---- football-data.co.uk: results, HT scores, xG, shots, corners, cards, odds
+          curl -fsSL --retry 3 --retry-delay 10 -A "$UA" \
+            "https://www.football-data.co.uk/mmz4281/${SEASON_CODE}/E0.csv" -o /tmp/E0.csv
+          grep -q 'HomeTeam,AwayTeam,FTHG,FTAG' /tmp/E0.csv || { echo "E0.csv header looks wrong"; exit 1; }
+          new_rows=$(( $(wc -l < /tmp/E0.csv) - 1 ))
+          target="data/football-data/E0_${SEASON_CODE}.csv"
+          if [ -f "$target" ]; then
+            old_rows=$(( $(wc -l < "$target") - 1 ))
+            if [ "$new_rows" -lt "$old_rows" ]; then
+              echo "Refusing to shrink $target ($old_rows -> $new_rows rows)"; exit 1
+            fi
+          fi
+          mv /tmp/E0.csv "$target"
+          echo "football-data.co.uk: $new_rows played matches"
+
+          # ---- fixturedownload.com: full 380-fixture list incl. unplayed (for scheduled fixtures + cross-check)
+          curl -fsSL --retry 3 --retry-delay 10 -A "$UA" \
+            "https://fixturedownload.com/feed/json/${FIXTURE_FEED}" -o /tmp/fixtures.json
+          ftarget="data/fixturedownload/${FIXTURE_FEED}.json"
+          python3 - "$ftarget" <<'PY'
+          import json, os, sys
+          new = json.load(open('/tmp/fixtures.json'))
+          assert isinstance(new, list) and len(new) == 380, f"expected 380 fixtures, got {len(new)}"
+          scored = lambda d: sum(1 for m in d if m.get('HomeTeamScore') is not None)
+          target = sys.argv[1]
+          if os.path.exists(target):
+              old = json.load(open(target))
+              assert scored(new) >= scored(old), f"refusing to shrink: {scored(old)} -> {scored(new)} scored"
+          os.replace('/tmp/fixtures.json', target)
+          print(f"fixturedownload.com: {scored(new)} scored / {len(new)} fixtures")
+          PY
+
+      - name: Backfill past seasons (one-off)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.backfill }}
+        run: |
+          set -euo pipefail
+          for y in $(seq 0 25); do
+            code=$(printf "%02d%02d" "$y" "$((y+1))")
+            curl -fsSL --retry 3 --retry-delay 10 -A "$UA" \
+              "https://www.football-data.co.uk/mmz4281/${code}/E0.csv" -o "data/football-data/E0_${code}.csv"
+            echo "$code: $(( $(wc -l < data/football-data/E0_${code}.csv) - 1 )) rows"
+            sleep 2
+          done
+
+      - name: Commit if anything changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Data update $(date -u +'%Y-%m-%d %H:%M') UTC"
+            git push
+          fi
